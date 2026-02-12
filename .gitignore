@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+.venv/
+
+# Logs and screenshots
+logs/
+screenshots/
+
+# User profile configs (contain passwords!)
+profiles/*.json
+!profiles/example_*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini

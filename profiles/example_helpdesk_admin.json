@@ -1,0 +1,34 @@
+{
+    "_comment": "Example profile for Helpdesk / Admin roles in Melbourne, Australia",
+    "_instructions": "Copy this file, rename it (e.g. my_profile.json), and fill in YOUR details below",
+
+    "linkedin_email": "your_email@gmail.com",
+    "linkedin_password": "your_linkedin_password",
+
+    "keywords": [
+        "helpdesk",
+        "IT helpdesk",
+        "service helpdesk",
+        "admin assistant",
+        "office administrator"
+    ],
+    "location": "Melbourne, Victoria, Australia",
+    "max_applications": 50,
+    "search_radius_km": 100,
+
+    "phone_number": "0400000000",
+    "linkedin_profile_url": "https://www.linkedin.com/in/your-profile/",
+    "years_of_experience": "3",
+    "salary_expectation": "65000",
+    "notice_period": "2 weeks",
+    "city_for_forms": "Melbourne",
+
+    "requires_sponsorship": false,
+    "work_authorized": true,
+
+    "sponsorship_answer_text": "No, I do not require visa sponsorship. I have full work rights.",
+    "work_auth_answer_text": "Yes, I am legally authorized to work with unrestricted work rights.",
+
+    "cover_letter_text": "I have 3+ years of experience in IT helpdesk support, service desk operations, and office administration. I am skilled in customer service, troubleshooting, and managing day-to-day office tasks. I do not require sponsorship and am keen to contribute to your team.",
+    "default_answer_text": "I have 3+ years of experience in helpdesk support, IT service desk, and office administration. I am enthusiastic about this opportunity."
+}

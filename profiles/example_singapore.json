@@ -1,0 +1,34 @@
+{
+    "_comment": "Example profile for Data Engineer roles in Singapore",
+    "_instructions": "Copy this file, rename it (e.g. my_profile.json), and fill in YOUR details below",
+
+    "linkedin_email": "your_email@gmail.com",
+    "linkedin_password": "your_linkedin_password",
+
+    "keywords": [
+        "data engineer",
+        "data engineering",
+        "etl engineer",
+        "data platform engineer",
+        "analytics engineer"
+    ],
+    "location": "Singapore",
+    "max_applications": 50,
+    "search_radius_km": 50,
+
+    "phone_number": "+6590000000",
+    "linkedin_profile_url": "https://www.linkedin.com/in/your-profile/",
+    "years_of_experience": "5",
+    "salary_expectation": "8000",
+    "notice_period": "2 weeks",
+    "city_for_forms": "Singapore",
+
+    "requires_sponsorship": false,
+    "work_authorized": true,
+
+    "sponsorship_answer_text": "No, I do not require visa sponsorship. I have valid work authorization and can start immediately.",
+    "work_auth_answer_text": "Yes, I am legally authorized to work and do not require sponsorship.",
+
+    "cover_letter_text": "I have 5+ years of experience in data engineering with expertise in Python, SQL, Spark, Airflow, and cloud platforms (AWS/GCP/Azure). I do not require sponsorship and can start immediately. I am keen to contribute to your team.",
+    "default_answer_text": "I have 5+ years of experience in data engineering with expertise in Python, SQL, Spark, Airflow, and cloud platforms. I am available to start immediately."
+}
