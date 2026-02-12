@@ -201,4 +201,4 @@ This tool is for educational purposes. Use it responsibly and in accordance with
 
 ## License
 
-MIT License - free to use, modify, and share.
+MIT License - Copyright (c) 2026 Rahul Poolanchalil. Free to use, modify, and share.
