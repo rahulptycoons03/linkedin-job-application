@@ -1,0 +1,44 @@
+{
+    "_comment": "Copy this file to profiles/my_profile.json and fill in YOUR details",
+    "_instructions": "Remove the _comment and _instructions fields after copying",
+
+    "linkedin_email": "your_email@example.com",
+    "linkedin_password": "your_password_here",
+
+    "keywords": [
+        "data engineer",
+        "data engineering",
+        "etl engineer"
+    ],
+    "relevant_title_keywords": [
+        "data engineer",
+        "data engineering",
+        "etl engineer",
+        "etl developer",
+        "data platform",
+        "analytics engineer",
+        "big data engineer",
+        "data pipeline",
+        "data warehouse",
+        "data integration"
+    ],
+    "location": "Melbourne, Victoria, Australia",
+    "max_applications": 50,
+    "search_radius_km": 100,
+
+    "phone_number": "0400000000",
+    "linkedin_profile_url": "https://www.linkedin.com/in/yourprofile/",
+    "years_of_experience": "5",
+    "salary_expectation": "120000",
+    "notice_period": "2 weeks",
+    "city_for_forms": "Melbourne",
+
+    "requires_sponsorship": false,
+    "work_authorized": true,
+
+    "sponsorship_answer_text": "No, I do not require visa sponsorship. I have full work rights.",
+    "work_auth_answer_text": "Yes, I am legally authorized to work with unrestricted work rights.",
+
+    "cover_letter_text": "I have X+ years of experience in [field]. I am keen to contribute to your team.",
+    "default_answer_text": "I have X+ years of experience in [field]. I am enthusiastic about this opportunity."
+}

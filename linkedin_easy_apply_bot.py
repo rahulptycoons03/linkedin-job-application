@@ -31,6 +31,7 @@ from urllib.parse import quote_plus
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -81,9 +82,16 @@ def load_config(profile_path: str) -> dict:
     cfg.setdefault("requires_sponsorship", False)
     cfg.setdefault("work_authorized", True)
     cfg.setdefault("search_radius_km", 100)
+    cfg.setdefault("search_start", 0)
     cfg.setdefault("cover_letter_text", "")
     cfg.setdefault("default_answer_text", "")
-    cfg.setdefault("city_for_forms", cfg["location"].split(",")[0].strip())
+    loc = cfg.get("location", "")
+    if "Melbourne" in loc or "Australia" in loc:
+        cfg.setdefault("city_for_forms", "Melbourne, Victoria, Australia")
+    else:
+        cfg.setdefault("city_for_forms", loc.split(",")[0].strip() if loc else "Melbourne, Victoria, Australia")
+    cfg.setdefault("relevant_title_keywords", cfg.get("keywords", []))
+    cfg.setdefault("max_pages_per_keyword", 10)
 
     return cfg
 
@@ -167,6 +175,36 @@ def js_find_and_click_button(driver, button_texts):
     return result or ""
 
 
+def js_click_first_apply_button(driver):
+    """
+    Click the first visible Apply/Easy Apply button via JS.
+    Returns button text if clicked, else empty string.
+    """
+    result = driver.execute_script("""
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+            var btn = buttons[i];
+            if (btn.offsetParent === null) continue;
+            var txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+            var aria = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
+            var cls = (btn.className || '').toLowerCase();
+
+            var easyByText = txt.indexOf('easy apply') >= 0;
+            var easyByAria = aria.indexOf('easy apply') >= 0;
+            var applyByClass = cls.indexOf('jobs-apply-button') >= 0 && (txt.indexOf('apply') >= 0 || aria.indexOf('apply') >= 0);
+            var applyByAria = aria.indexOf('apply to') >= 0;
+
+            if (easyByText || easyByAria || applyByClass || applyByAria) {
+                btn.scrollIntoView({block: 'center'});
+                btn.click();
+                return (btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').trim();
+            }
+        }
+        return '';
+    """)
+    return result or ""
+
+
 def js_scroll_modal(driver):
     """Scroll the Easy Apply modal content to the bottom."""
     driver.execute_script("""
@@ -184,6 +222,68 @@ def js_scroll_modal(driver):
         }
     """)
     time.sleep(0.2)
+
+
+def _get_modal_button_texts(driver):
+    """Return list of (text, aria-label) for visible buttons in Easy Apply modal."""
+    result = driver.execute_script("""
+        var container = document.querySelector('.jobs-easy-apply-content') || document.querySelector('.artdeco-modal__content') || document.body;
+        var buttons = container.querySelectorAll('button');
+        var out = [];
+        for (var i = 0; i < buttons.length; i++) {
+            var btn = buttons[i];
+            if (btn.offsetParent === null) continue;
+            var txt = (btn.innerText || btn.textContent || '').trim();
+            var aria = (btn.getAttribute('aria-label') || '').trim();
+            if (txt || aria) out.push([txt, aria]);
+        }
+        return out;
+    """)
+    return result or []
+
+
+def _has_validation_errors(driver) -> bool:
+    """True if modal shows inline validation errors (missing required, etc.)."""
+    try:
+        errors = driver.find_elements(By.XPATH, "//div[contains(@class,'artdeco-inline-feedback--error')]")
+        for e in errors:
+            if e.is_displayed() and (e.text or "").strip():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _click_modal_button_by_keywords(driver) -> str:
+    """
+    Find and click the right modal button by searching for keywords.
+    Priority: Submit application > Review > Next/Continue.
+    Returns the button text clicked, or '' if none matched.
+    """
+    pairs = _get_modal_button_texts(driver)
+    # Decide which action to take by scanning all buttons
+    submit_btn = None
+    review_btn = None
+    next_btn = None
+    for (txt, aria) in pairs:
+        combined = (f"{txt} {aria}".strip()).lower()
+        if "submit application" in combined:
+            submit_btn = txt or aria or "Submit application"
+        if "review" in combined and not review_btn:
+            review_btn = txt or aria or "Review"
+        if "next" in combined or "continue to next" in combined:
+            next_btn = txt or aria or "Next"
+    # Click in priority order
+    for candidate in [submit_btn, review_btn, next_btn]:
+        if not candidate:
+            continue
+        if js_find_and_click_button(driver, [candidate]):
+            return candidate
+    # Fallback: try exact common labels
+    for label in ["Submit application", "Review your application", "Review", "Continue to next step", "Next"]:
+        if js_find_and_click_button(driver, [label]):
+            return label
+    return ""
 
 
 # ──────────────────────────────────────────────
@@ -233,35 +333,103 @@ def build_search_url(keywords: str, location: str) -> str:
     kw = quote_plus(keywords)
     loc = quote_plus(location)
     radius = CONFIG.get("search_radius_km", 100)
-    return f"https://www.linkedin.com/jobs/search/?keywords={kw}&location={loc}&f_AL=true&distance={radius}&sortBy=R"
+    start = int(CONFIG.get("search_start", 0) or 0)
+    start_part = f"&start={start}" if start > 0 else ""
+    return f"https://www.linkedin.com/jobs/search/?keywords={kw}&location={loc}&f_AL=true&distance={radius}&sortBy=R{start_part}"
+
+
+def _get_job_cards(driver):
+    """Get visible job cards across old/new LinkedIn layouts."""
+    selectors = [
+        "//li[@data-occludable-job-id]",
+        "//li[contains(@class,'jobs-search-results__list-item')]",
+        "//div[contains(@class,'job-card-container')]",
+    ]
+    for xp in selectors:
+        cards = driver.find_elements(By.XPATH, xp)
+        if cards:
+            return cards
+    return []
 
 
 def get_easy_apply_jobs(driver) -> list:
-    """Return list of indices for Easy Apply job cards (skips already-applied)."""
-    cards = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")
+    """
+    Return job-card indices to process (skips already-applied).
+    In filtered searches (f_AL=true), many cards no longer show the literal
+    'Easy Apply' text, so treat visible non-applied cards as valid targets.
+    """
+    cards = _get_job_cards(driver)
     jobs = []
     for i, card in enumerate(cards):
         try:
             text = (card.text or "").lower()
-            if "applied" in text or "see application" in text:
+            if _contains_applied_marker(text):
                 continue
-            if "easy apply" in text:
-                jobs.append(i)
+            jobs.append(i)
         except StaleElementReferenceException:
             continue
     return jobs
 
 
+def _get_page_job_records(driver):
+    """
+    Return job records for current page:
+    [{'id': str, 'index': int, 'text': str}, ...]
+    """
+    cards = _get_job_cards(driver)
+    records = []
+    for i, card in enumerate(cards):
+        try:
+            card_text = (card.text or "").strip()
+            lower_text = card_text.lower()
+            if _contains_applied_marker(lower_text):
+                continue
+
+            job_id = (
+                card.get_attribute("data-occludable-job-id")
+                or card.get_attribute("data-job-id")
+                or ""
+            ).strip()
+            if not job_id:
+                try:
+                    link = card.find_element(By.XPATH, ".//a[contains(@href,'/jobs/view/')]")
+                    href = (link.get_attribute("href") or "").strip()
+                    job_id = href or f"idx:{i}:{lower_text[:40]}"
+                except Exception:
+                    job_id = f"idx:{i}:{lower_text[:40]}"
+
+            records.append({
+                "id": job_id,
+                "index": i,
+                "text": lower_text,
+            })
+        except StaleElementReferenceException:
+            continue
+    return records
+
+
 def click_job_card(driver, index: int):
     """Click on a job card by index."""
-    cards = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")
+    cards = _get_job_cards(driver)
     if index >= len(cards):
         return False
     card = cards[index]
     try:
-        link = card.find_element(By.TAG_NAME, "a")
+        link = None
+        for xp in [
+            ".//a[contains(@class,'job-card-container__link')]",
+            ".//a[contains(@class,'job-card-list__title')]",
+            ".//a",
+        ]:
+            try:
+                link = card.find_element(By.XPATH, xp)
+                break
+            except NoSuchElementException:
+                continue
+        if link is None:
+            return False
         js_click(driver, link)
-        time.sleep(1)
+        time.sleep(2)
         return True
     except Exception:
         return False
@@ -281,6 +449,22 @@ def get_job_title(driver) -> str:
     return "(unknown title)"
 
 
+def _contains_applied_marker(text: str) -> bool:
+    """True when the card/title indicates this role was already applied."""
+    txt = (text or "").lower()
+    return "applied" in txt or "see application" in txt
+
+
+def _is_relevant_title(title: str) -> bool:
+    """Only allow titles matching configured relevant role keywords."""
+    title_l = (title or "").lower()
+    role_keywords = CONFIG.get("relevant_title_keywords") or CONFIG.get("keywords") or []
+    role_keywords = [str(k).strip().lower() for k in role_keywords if str(k).strip()]
+    if not role_keywords:
+        return True
+    return any(k in title_l for k in role_keywords)
+
+
 # ──────────────────────────────────────────────
 #  EASY APPLY MODAL
 # ──────────────────────────────────────────────
@@ -288,23 +472,35 @@ def get_job_title(driver) -> str:
 def click_easy_apply_button(driver) -> bool:
     """Find and click the Easy Apply button on the job detail page."""
     xpaths = [
-        "//button[contains(@class,'jobs-apply-button') and contains(@aria-label, 'Easy')]",
+        "//button[contains(@class,'jobs-apply-button') and contains(translate(@aria-label, 'EASYAPPLY', 'easyapply'), 'easy apply')]",
+        "//button[contains(@class,'jobs-apply-button') and contains(translate(normalize-space(.), 'EASYAPPLY', 'easyapply'), 'easy apply')]",
+        "//button[contains(@class,'jobs-apply-button') and contains(translate(@aria-label, 'APPLY', 'apply'), 'apply')]",
         "//button[contains(@aria-label, 'Easy Apply')]",
         "//button[.//span[contains(text(),'Easy Apply')]]",
+        "//button[contains(@aria-label, 'Apply to')]",
     ]
+    # Let the job details pane finish rendering the action buttons.
+    time.sleep(1)
     for xp in xpaths:
         try:
-            btn = driver.find_element(By.XPATH, xp)
+            btn = WebDriverWait(driver, 4).until(
+                EC.presence_of_element_located((By.XPATH, xp))
+            )
             if btn.is_displayed():
                 js_click(driver, btn)
                 time.sleep(1.5)
                 return True
-        except NoSuchElementException:
+        except (NoSuchElementException, TimeoutException):
             continue
 
     # JavaScript fallback
     clicked = js_find_and_click_button(driver, ["Easy Apply"])
     if clicked:
+        time.sleep(1.5)
+        return True
+    clicked = js_click_first_apply_button(driver)
+    if clicked:
+        log(f"  JS clicked apply button: {clicked}")
         time.sleep(1.5)
         return True
     return False
@@ -326,8 +522,19 @@ def _is_work_auth_question(label_text: str) -> bool:
     ])
 
 
+def _is_placeholder_option(opt_text: str) -> bool:
+    """True if option looks like a placeholder (Select..., Choose..., --, etc.)."""
+    t = (opt_text or "").strip().lower()
+    if not t:
+        return True
+    for p in ["select", "choose", "please select", "select one", "--", "none", "n/a", "select...", "choose..."]:
+        if p in t or t == p:
+            return True
+    return False
+
+
 def _smart_answer_for_select(label_text: str, options) -> str:
-    """Pick the best dropdown option based on the question."""
+    """Pick the best dropdown option: known question first, else list options and pick first valid."""
     lbl = label_text.lower()
     sponsorship_answer = "no" if not CONFIG.get("requires_sponsorship", False) else "yes"
     work_auth_answer = "yes" if CONFIG.get("work_authorized", True) else "no"
@@ -342,10 +549,17 @@ def _smart_answer_for_select(label_text: str, options) -> str:
             if (opt.text or "").strip().lower() == work_auth_answer:
                 return opt.text.strip()
 
-    # Default: prefer "Yes", then first non-placeholder option
+    # Known: prefer "Yes", then first non-placeholder
     for opt in options:
         if (opt.text or "").strip().lower() == "yes":
             return opt.text.strip()
+
+    # Unknown question: list options and pick first non-placeholder
+    opt_texts = [(opt.text or "").strip() for opt in options]
+    valid = [t for t in opt_texts if t and not _is_placeholder_option(t)]
+    if valid:
+        log(f"    Unknown dropdown '{label_text[:50]}' — options: {opt_texts[:10]}{'...' if len(opt_texts) > 10 else ''}; choosing '{valid[0]}'")
+        return valid[0]
     return ""
 
 
@@ -376,6 +590,36 @@ def _get_label(driver, element) -> str:
     return ""
 
 
+def _try_select_autocomplete_option(inp):
+    """
+    For combobox/autocomplete fields, choose a dropdown suggestion
+    after typing text (common in city/location fields).
+    """
+    try:
+        role = (inp.get_attribute("role") or "").lower()
+        aria_auto = (inp.get_attribute("aria-autocomplete") or "").lower()
+        controls = (inp.get_attribute("aria-controls") or "").strip()
+        has_popup = (inp.get_attribute("aria-haspopup") or "").lower()
+
+        is_autocomplete = (
+            role == "combobox"
+            or aria_auto in ("list", "both")
+            or bool(controls)
+            or has_popup in ("listbox", "true")
+        )
+        if not is_autocomplete:
+            return False
+
+        time.sleep(0.3)
+        inp.send_keys(Keys.ARROW_DOWN)
+        time.sleep(0.15)
+        inp.send_keys(Keys.ENTER)
+        time.sleep(0.2)
+        return True
+    except Exception:
+        return False
+
+
 # ──── Form Filling ────
 
 def fill_form_fields(driver) -> bool:
@@ -383,7 +627,7 @@ def fill_form_fields(driver) -> bool:
     filled = False
     modal = "//div[contains(@class,'jobs-easy-apply')]"
     years = CONFIG.get("years_of_experience", "5")
-    city = CONFIG.get("city_for_forms", "Melbourne")
+    city = CONFIG.get("city_for_forms", "Melbourne, Victoria, Australia")
     salary = CONFIG.get("salary_expectation", "120000")
     phone = CONFIG.get("phone_number", "")
     profile_url = CONFIG.get("linkedin_profile_url", "")
@@ -407,6 +651,8 @@ def fill_form_fields(driver) -> bool:
                     inp.send_keys(years)
                 elif any(w in label_text for w in ["city", "location"]):
                     inp.send_keys(city)
+                    if _try_select_autocomplete_option(inp):
+                        log("    Selected city/location from dropdown")
                 elif any(w in label_text for w in ["salary", "pay", "rate", "compensation"]):
                     inp.send_keys(salary)
                 elif any(w in label_text for w in ["phone", "mobile"]):
@@ -423,6 +669,10 @@ def fill_form_fields(driver) -> bool:
                     inp.send_keys("Immediately")
                 else:
                     inp.send_keys(years)  # safe default for numeric fields
+                # Some LinkedIn text inputs are autocomplete even when label
+                # doesn't explicitly include "city/location".
+                if _try_select_autocomplete_option(inp):
+                    log(f"    Selected dropdown option for '{label_text}'")
                 filled = True
                 log(f"    Filled input '{label_text}'")
                 time.sleep(0.1)
@@ -462,7 +712,7 @@ def fill_form_fields(driver) -> bool:
     except Exception:
         pass
 
-    # 3) Select dropdowns
+    # 3) Select dropdowns (<select>)
     try:
         selects = driver.find_elements(By.XPATH, f"{modal}//select")
         for sel in selects:
@@ -472,16 +722,22 @@ def fill_form_fields(driver) -> bool:
                 if current:
                     continue
                 label_text = _get_label(driver, sel)
-                options = select_obj.options
+                options = list(select_obj.options)
+                opt_texts = [(o.text or "").strip() for o in options]
                 answer = _smart_answer_for_select(label_text, options)
                 if answer:
                     select_obj.select_by_visible_text(answer)
                     filled = True
                     log(f"    Selected '{answer}' in dropdown '{label_text}'")
                 elif len(options) > 1:
-                    select_obj.select_by_index(1)
+                    # First non-placeholder
+                    valid = [t for t in opt_texts if t and not _is_placeholder_option(t)]
+                    if valid:
+                        select_obj.select_by_visible_text(valid[0])
+                        log(f"    Unknown select '{label_text[:40]}' — chose first option: '{valid[0]}'")
+                    else:
+                        select_obj.select_by_index(1)
                     filled = True
-                    log(f"    Selected first option in dropdown '{label_text}'")
                 time.sleep(0.1)
             except Exception:
                 continue
@@ -554,12 +810,9 @@ def _get_modal_progress(driver) -> str:
 def process_easy_apply_modal(driver) -> bool:
     """
     Navigate through the Easy Apply modal steps.
-    Fills form fields FIRST, then clicks Next/Review/Submit.
-    Detects when stuck and gives up after 3 retries.
-    Returns True if application was submitted successfully.
+    Fills form fields first, checks what's missing (validation errors), then
+    searches for keywords (Submit / Review / Next) and clicks the right button.
     """
-    SUBMIT_TEXTS = ["Submit application"]
-    NEXT_TEXTS = ["Review your application", "Review", "Continue to next step", "Next"]
     max_steps = 25
     stuck_count = 0
 
@@ -569,49 +822,47 @@ def process_easy_apply_modal(driver) -> bool:
         js_scroll_modal(driver)
         current_progress = _get_modal_progress(driver)
 
-        # ALWAYS fill form fields first
+        # Fill form fields first
         filled = fill_form_fields(driver)
         if filled:
             js_scroll_modal(driver)
+            time.sleep(0.3)
 
-        # Try Submit
-        clicked = js_find_and_click_button(driver, SUBMIT_TEXTS)
-        if clicked:
-            log(f"    -> Clicked '{clicked}'")
-            time.sleep(1.5)
+        # If validation errors are shown, don't click Next — something is missing
+        if _has_validation_errors(driver):
+            log("    Validation errors present — not clicking Next until fixed")
+            stuck_count += 1
+            if stuck_count >= 3:
+                log("    Still errors after 3 passes. Taking screenshot and giving up.")
+                screenshot(driver, f"step{step+1}_validation_errors")
+                break
+            continue
+        stuck_count = 0
+
+        # Search for Submit / Review / Next by keyword and click the right one
+        clicked = _click_modal_button_by_keywords(driver)
+        if not clicked:
+            log("    No Submit/Review/Next button found. Breaking.")
+            screenshot(driver, f"step{step+1}_no_button")
+            break
+
+        log(f"    -> Clicked '{clicked}'")
+        time.sleep(1 if "Submit" not in clicked else 1.5)
+
+        if "submit" in clicked.lower():
             _handle_post_submit(driver)
             return True
 
-        # Try Next / Review
-        clicked = js_find_and_click_button(driver, NEXT_TEXTS)
-        if clicked:
-            log(f"    -> Clicked '{clicked}'")
-            time.sleep(1)
-
-            new_progress = _get_modal_progress(driver)
-            if new_progress and new_progress == current_progress:
-                stuck_count += 1
-                log(f"    Progress unchanged ({new_progress}). Stuck count: {stuck_count}")
-                if stuck_count >= 3:
-                    log(f"    Stuck for 3 attempts. Taking screenshot...")
-                    screenshot(driver, f"step{step+1}_stuck")
-                    try:
-                        errors = driver.find_elements(By.XPATH, "//div[contains(@class,'artdeco-inline-feedback--error')]")
-                        visible = [e.text for e in errors if e.is_displayed() and e.text.strip()]
-                        if visible:
-                            log(f"    Validation errors: {visible}")
-                    except Exception:
-                        pass
-                    log(f"    Giving up on this application.")
-                    break
-            else:
-                stuck_count = 0
-            continue
-
-        # No button found
-        log(f"    No button found. Breaking.")
-        screenshot(driver, f"step{step+1}_no_button")
-        break
+        new_progress = _get_modal_progress(driver)
+        if new_progress and new_progress == current_progress:
+            stuck_count += 1
+            log(f"    Progress unchanged ({new_progress}). Stuck count: {stuck_count}")
+            if stuck_count >= 3:
+                log("    Stuck for 3 attempts. Giving up.")
+                screenshot(driver, f"step{step+1}_stuck")
+                break
+        else:
+            stuck_count = 0
 
     _close_modal(driver)
     return False
@@ -679,6 +930,27 @@ def _ensure_easy_apply_filter(driver):
         log(f"  Could not set Easy Apply filter: {e}")
 
 
+def _go_to_next_results_page(driver) -> bool:
+    """Click the next page button in LinkedIn job search results."""
+    next_xpaths = [
+        "//button[@aria-label='View next page']",
+        "//button[contains(@aria-label,'next page')]",
+        "//button[contains(@aria-label,'Next')]",
+    ]
+    for xp in next_xpaths:
+        try:
+            btn = driver.find_element(By.XPATH, xp)
+            if btn.is_displayed() and btn.is_enabled():
+                js_click(driver, btn)
+                time.sleep(2)
+                return True
+        except NoSuchElementException:
+            continue
+        except Exception:
+            continue
+    return False
+
+
 # ──────────────────────────────────────────────
 #  MAIN APPLICATION LOOP
 # ──────────────────────────────────────────────
@@ -687,6 +959,7 @@ def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
     """Search for jobs with a keyword and apply. Returns updated count."""
     location = CONFIG["location"]
     max_apps = CONFIG.get("max_applications", 50)
+    max_pages = int(CONFIG.get("max_pages_per_keyword", 10))
     url = build_search_url(keyword, location)
 
     log(f"\n{'='*60}")
@@ -698,36 +971,84 @@ def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
     _ensure_easy_apply_filter(driver)
     time.sleep(1)
 
-    job_indices = get_easy_apply_jobs(driver)
-    log(f"Found {len(job_indices)} Easy Apply jobs on this page")
+    for page_num in range(1, max_pages + 1):
+        log(f"Processing results page {page_num}/{max_pages}")
+        current_results_url = driver.current_url
+        processed_ids = set()
+        no_progress_passes = 0
+        while True:
+            if applied_count >= max_apps:
+                log(f"Reached max applications ({max_apps}). Stopping.")
+                return applied_count
 
-    for idx in job_indices:
-        if applied_count >= max_apps:
-            log(f"Reached max applications ({max_apps}). Stopping.")
-            return applied_count
+            page_records = _get_page_job_records(driver)
+            if not page_records:
+                log("Found 0 Easy Apply jobs on this page")
+                break
 
-        if not click_job_card(driver, idx):
-            continue
+            pending = [r for r in page_records if r["id"] not in processed_ids]
+            if not pending:
+                log("No unprocessed Easy Apply jobs left on this page.")
+                break
 
-        title = get_job_title(driver)
-        log(f"\nJob #{applied_count + 1}: {title}")
+            if no_progress_passes == 0:
+                log(f"Found {len(page_records)} Easy Apply jobs on this page")
+            log(f"Pending jobs on this page: {len(pending)}")
 
-        if not click_easy_apply_button(driver):
-            log(f"  No Easy Apply button found. Skipping.")
-            continue
+            before_attempt_count = applied_count
+            for rec in pending:
+                processed_ids.add(rec["id"])
+                idx = rec["index"]
+                if not click_job_card(driver, idx):
+                    continue
 
-        success = process_easy_apply_modal(driver)
-        if success:
-            applied_count += 1
-            log(f"  *** APPLIED SUCCESSFULLY *** (Total: {applied_count})")
-        else:
-            log(f"  Could not complete application. Skipping.")
+                title = get_job_title(driver)
+                log(f"\nJob #{applied_count + 1}: {title}")
+                if _contains_applied_marker(title):
+                    log("  Skipping: already applied role.")
+                    continue
+                if not _is_relevant_title(title):
+                    log("  Skipping: non-data role based on title keywords.")
+                    continue
 
-        # Go back to search results
-        driver.get(url)
-        time.sleep(2)
-        job_indices_new = get_easy_apply_jobs(driver)
-        log(f"  Back to search. {len(job_indices_new)} Easy Apply jobs remaining.")
+                if not click_easy_apply_button(driver):
+                    log("  No Easy Apply button found. Skipping.")
+                    continue
+
+                success = process_easy_apply_modal(driver)
+                if success:
+                    applied_count += 1
+                    log(f"  *** APPLIED SUCCESSFULLY *** (Total: {applied_count})")
+                else:
+                    log("  Could not complete application. Skipping.")
+
+                # Return to same results page and continue processing pending jobs.
+                driver.get(current_results_url)
+                time.sleep(2)
+                _ensure_easy_apply_filter(driver)
+                time.sleep(1)
+
+                if applied_count >= max_apps:
+                    log(f"Reached max applications ({max_apps}). Stopping.")
+                    return applied_count
+
+            if applied_count == before_attempt_count:
+                no_progress_passes += 1
+            else:
+                no_progress_passes = 0
+
+            if no_progress_passes >= 2:
+                log("No progress after 2 passes on this page. Moving to next page.")
+                break
+
+        if page_num >= max_pages:
+            log("Reached max pages per keyword.")
+            break
+        if not _go_to_next_results_page(driver):
+            log("No next page available. Stopping pagination for this keyword.")
+            break
+        _ensure_easy_apply_filter(driver)
+        time.sleep(1)
 
     return applied_count
 
