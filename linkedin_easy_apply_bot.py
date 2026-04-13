@@ -25,6 +25,7 @@ import sys
 import os
 import argparse
 import traceback
+import tempfile
 from datetime import datetime
 from urllib.parse import quote_plus
 
@@ -39,6 +40,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     StaleElementReferenceException,
     ElementClickInterceptedException,
+    WebDriverException,
 )
 
 
@@ -47,6 +49,7 @@ from selenium.common.exceptions import (
 # ──────────────────────────────────────────────
 
 CONFIG = {}   # populated by load_config()
+CURRENT_JOB_TITLE = ""
 
 # Directory paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +95,7 @@ def load_config(profile_path: str) -> dict:
         cfg.setdefault("city_for_forms", loc.split(",")[0].strip() if loc else "Melbourne, Victoria, Australia")
     cfg.setdefault("relevant_title_keywords", cfg.get("keywords", []))
     cfg.setdefault("max_pages_per_keyword", 10)
+    cfg.setdefault("modal_max_seconds", 8 * 60)
 
     return cfg
 
@@ -103,7 +107,15 @@ def load_config(profile_path: str) -> dict:
 def log(msg: str):
     """Print a timestamped log message."""
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    text = f"[{ts}] {msg}"
+    # Windows consoles often use a legacy encoding (cp1252) which can crash on
+    # special characters from LinkedIn job titles. Replace unknown chars safely.
+    try:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+    except Exception:
+        pass
+    print(text, flush=True)
 
 
 def screenshot(driver, label: str = "debug"):
@@ -127,6 +139,12 @@ def create_driver():
     options = Options()
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    # Use an isolated temp profile to avoid "profile in use"/startup crashes.
+    chrome_profile_dir = tempfile.mkdtemp(prefix="linkedin-ea-chrome-")
+    options.add_argument(f"--user-data-dir={chrome_profile_dir}")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     driver = webdriver.Chrome(options=options)
@@ -293,18 +311,97 @@ def _click_modal_button_by_keywords(driver) -> str:
 def login(driver):
     """Log into LinkedIn. Handles verification/captcha with manual wait."""
     log("Navigating to LinkedIn login...")
-    driver.get("https://www.linkedin.com/login")
-    time.sleep(2)
+    login_url = "https://www.linkedin.com/login"
+    for attempt in range(3):
+        try:
+            driver.get(login_url)
+            time.sleep(2)
+            break
+        except WebDriverException as e:
+            log(f"  Login navigation error (attempt {attempt + 1}/3): {e}")
+            if attempt == 2:
+                # Re-raise on final attempt so main() can capture and screenshot as fatal
+                raise
+            time.sleep(5)
+
+    # If we're already logged in, LinkedIn may redirect away from /login/.
+    if "linkedin.com/feed" in (driver.current_url or "").lower() or "/feed/" in (driver.current_url or "").lower():
+        log("Already logged in. Skipping login form.")
+        return
 
     try:
-        user_field = driver.find_element(By.ID, "username")
-        pass_field = driver.find_element(By.ID, "password")
+        # LinkedIn sometimes changes the underlying input IDs/names.
+        user_field = None
+        pass_field = None
+        user_selectors = [
+            (By.ID, "username"),
+            (By.ID, "session_key"),
+            (By.NAME, "session_key"),
+            (By.CSS_SELECTOR, "input[name='session_key']"),
+            (By.CSS_SELECTOR, "input#session_key"),
+            (By.CSS_SELECTOR, "input[type='text'][name='session_key']"),
+            (By.CSS_SELECTOR, "input[type='email']"),
+        ]
+        pass_selectors = [
+            (By.ID, "password"),
+            (By.ID, "session_password"),
+            (By.NAME, "session_password"),
+            (By.CSS_SELECTOR, "input[name='session_password']"),
+            (By.CSS_SELECTOR, "input#session_password"),
+            (By.CSS_SELECTOR, "input[type='password'][name='session_password']"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+        ]
+
+        # Wait briefly for fields to appear.
+        end_at = time.time() + 25
+        while time.time() < end_at and (user_field is None or pass_field is None):
+            for how, what in user_selectors:
+                if user_field is not None:
+                    break
+                try:
+                    el = driver.find_element(how, what)
+                    if el.is_displayed():
+                        user_field = el
+                except Exception:
+                    pass
+            for how, what in pass_selectors:
+                if pass_field is not None:
+                    break
+                try:
+                    el = driver.find_element(how, what)
+                    if el.is_displayed():
+                        pass_field = el
+                except Exception:
+                    pass
+            if user_field is None or pass_field is None:
+                time.sleep(0.5)
+
+        if user_field is None or pass_field is None:
+            raise NoSuchElementException("Login input fields not found (username/password).")
+
         user_field.clear()
         user_field.send_keys(CONFIG["linkedin_email"])
         pass_field.clear()
         pass_field.send_keys(CONFIG["linkedin_password"])
 
-        submit = driver.find_element(By.XPATH, "//button[@type='submit']")
+        submit = None
+        submit_xps = [
+            "//button[@type='submit']",
+            "//button[contains(.,'Sign in')]",
+            "//button[contains(.,'Sign in')]//span",
+            "//button[contains(@aria-label,'Sign in')]",
+        ]
+        for xp in submit_xps:
+            try:
+                el = driver.find_element(By.XPATH, xp)
+                if el.is_displayed():
+                    submit = el
+                    break
+            except Exception:
+                continue
+        if submit is None:
+            raise NoSuchElementException("Login submit button not found.")
+
         submit.click()
         log("Credentials submitted. Waiting for login...")
         time.sleep(5)
@@ -429,7 +526,7 @@ def click_job_card(driver, index: int):
         if link is None:
             return False
         js_click(driver, link)
-        time.sleep(2)
+        time.sleep(1)
         return True
     except Exception:
         return False
@@ -462,7 +559,29 @@ def _is_relevant_title(title: str) -> bool:
     role_keywords = [str(k).strip().lower() for k in role_keywords if str(k).strip()]
     if not role_keywords:
         return True
-    return any(k in title_l for k in role_keywords)
+
+    # Normalize punctuation/spacing so "dataengineer", "data-engineer",
+    # and "data engineer" all compare consistently.
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+    title_norm = _norm(title_l)
+
+    # 1) direct match in raw title
+    if any(k in title_l for k in role_keywords):
+        return True
+
+    # 2) normalized match for compact/hyphenated variants
+    if any(_norm(k) and _norm(k) in title_norm for k in role_keywords):
+        return True
+
+    # 3) fallback data-role heuristic to avoid false skips
+    engineer_like = any(w in title_l for w in ["engineer", "engineering"])
+    data_like = any(w in title_l for w in ["data", "databricks", "etl", "analytics", "bi", "warehouse", "pipeline"])
+    if engineer_like and data_like:
+        return True
+
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -479,8 +598,8 @@ def click_easy_apply_button(driver) -> bool:
         "//button[.//span[contains(text(),'Easy Apply')]]",
         "//button[contains(@aria-label, 'Apply to')]",
     ]
-    # Let the job details pane finish rendering the action buttons.
-    time.sleep(1)
+    # Let the job details pane render action buttons (short pause for speed).
+    time.sleep(0.4)
     for xp in xpaths:
         try:
             btn = WebDriverWait(driver, 4).until(
@@ -488,7 +607,7 @@ def click_easy_apply_button(driver) -> bool:
             )
             if btn.is_displayed():
                 js_click(driver, btn)
-                time.sleep(1.5)
+                time.sleep(0.8)
                 return True
         except (NoSuchElementException, TimeoutException):
             continue
@@ -496,12 +615,12 @@ def click_easy_apply_button(driver) -> bool:
     # JavaScript fallback
     clicked = js_find_and_click_button(driver, ["Easy Apply"])
     if clicked:
-        time.sleep(1.5)
+        time.sleep(0.8)
         return True
     clicked = js_click_first_apply_button(driver)
     if clicked:
         log(f"  JS clicked apply button: {clicked}")
-        time.sleep(1.5)
+        time.sleep(0.8)
         return True
     return False
 
@@ -590,6 +709,108 @@ def _get_label(driver, element) -> str:
     return ""
 
 
+def _target_resume_name_for_job() -> str:
+    """Pick resume name from resume_mapping/default_resume using current job title."""
+    title_l = (CURRENT_JOB_TITLE or "").lower()
+    mappings = CONFIG.get("resume_mapping") or []
+    for mapping in mappings:
+        try:
+            keywords = [str(k).lower() for k in (mapping.get("title_keywords") or [])]
+            if title_l and any(k and k in title_l for k in keywords):
+                resume_name = str(mapping.get("resume_name") or "").strip()
+                if resume_name:
+                    return resume_name
+        except Exception:
+            continue
+    return str(CONFIG.get("default_resume") or "").strip()
+
+
+def _select_resume_from_linkedin_list(driver) -> bool:
+    """
+    Select the best matching resume from LinkedIn's resume list/dropdown in Easy Apply modal.
+    Returns True if a resume option was clicked.
+    """
+    target_resume = _target_resume_name_for_job()
+    if not target_resume:
+        return False
+
+    # Open resume chooser/list if collapsed.
+    openers = [
+        "//div[contains(@class,'jobs-easy-apply')]//button[contains(.,'Resume')]",
+        "//div[contains(@class,'jobs-easy-apply')]//button[contains(.,'Choose resume')]",
+        "//div[contains(@class,'jobs-easy-apply')]//button[contains(.,'Select resume')]",
+        "//div[contains(@class,'jobs-easy-apply')]//button[contains(.,'Show more resumes')]",
+    ]
+    for xp in openers:
+        try:
+            btn = driver.find_element(By.XPATH, xp)
+            if btn.is_displayed():
+                js_click(driver, btn)
+                time.sleep(0.2)
+                break
+        except Exception:
+            continue
+
+    selected = driver.execute_script(
+        """
+        function norm(s) {
+          return (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();
+        }
+        var targetRaw = arguments[0] || '';
+        var target = norm(targetRaw);
+        if (!target) return '';
+
+        var variants = [target, norm(targetRaw.replace(/[_-]/g, ' '))];
+        var tokens = variants.join(' ').split(' ').filter(function(t){ return t.length >= 5; });
+        var root = document.querySelector('.jobs-easy-apply-content') || document.querySelector('.artdeco-modal__content') || document;
+
+        var nodes = root.querySelectorAll('label, li, button, div[role=\"option\"], span, a, p');
+        function visible(el){ return !!el && el.offsetParent !== null; }
+        function clickNode(node){
+          var clickEl = node.closest('label, button, li, [role=\"option\"], a, div');
+          if (!clickEl) clickEl = node;
+          clickEl.scrollIntoView({block:'center'});
+          clickEl.click();
+          return (clickEl.innerText || node.innerText || '').trim();
+        }
+
+        // Pass 1: direct variant contains match
+        for (var i=0; i<nodes.length; i++){
+          var n = nodes[i];
+          if (!visible(n)) continue;
+          var t = norm(n.innerText || n.textContent || '');
+          if (!t) continue;
+          for (var v=0; v<variants.length; v++){
+            if (variants[v] && t.indexOf(variants[v]) >= 0){
+              return clickNode(n);
+            }
+          }
+        }
+
+        // Pass 2: token overlap fallback
+        for (var j=0; j<nodes.length; j++){
+          var n2 = nodes[j];
+          if (!visible(n2)) continue;
+          var t2 = norm(n2.innerText || n2.textContent || '');
+          if (!t2) continue;
+          var score = 0;
+          for (var k=0; k<tokens.length; k++){
+            if (t2.indexOf(tokens[k]) >= 0) score++;
+          }
+          if (score >= 2){
+            return clickNode(n2);
+          }
+        }
+        return '';
+        """,
+        target_resume,
+    )
+    if selected:
+        log(f"    Selected resume from list: '{selected}' (target: '{target_resume}')")
+        return True
+    return False
+
+
 def _try_select_autocomplete_option(inp):
     """
     For combobox/autocomplete fields, choose a dropdown suggestion
@@ -634,6 +855,13 @@ def fill_form_fields(driver) -> bool:
     notice = CONFIG.get("notice_period", "2 weeks")
     cover_letter = CONFIG.get("cover_letter_text", "")
     default_text = CONFIG.get("default_answer_text", "")
+
+    # 0) Resume selection from LinkedIn list/dropdown
+    try:
+        if _select_resume_from_linkedin_list(driver):
+            filled = True
+    except Exception:
+        pass
 
     # 1) Text / number inputs
     try:
@@ -815,8 +1043,15 @@ def process_easy_apply_modal(driver) -> bool:
     """
     max_steps = 25
     stuck_count = 0
+    start_time = time.time()
+    max_seconds = int(CONFIG.get("modal_max_seconds", 8 * 60) or (8 * 60))
 
     for step in range(max_steps):
+        # Safety: avoid getting stuck in a modal for too long (prevents session loss)
+        if (time.time() - start_time) > max_seconds:
+            log(f"    Modal time limit exceeded ({max_seconds}s). Taking screenshot and giving up.")
+            screenshot(driver, f"modal_timeout_{int(max_seconds)}s")
+            break
         log(f"  Step {step + 1}/{max_steps}")
 
         js_scroll_modal(driver)
@@ -847,7 +1082,7 @@ def process_easy_apply_modal(driver) -> bool:
             break
 
         log(f"    -> Clicked '{clicked}'")
-        time.sleep(1 if "Submit" not in clicked else 1.5)
+        time.sleep(0.5 if "Submit" not in clicked else 0.8)
 
         if "submit" in clicked.lower():
             _handle_post_submit(driver)
@@ -870,11 +1105,11 @@ def process_easy_apply_modal(driver) -> bool:
 
 def _handle_post_submit(driver):
     """Click Done/Dismiss after successful submission."""
-    time.sleep(1)
+    time.sleep(0.5)
     clicked = js_find_and_click_button(driver, ["Done", "Dismiss"])
     if clicked:
         log(f"    -> Clicked '{clicked}' (post-submit)")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
 
 def _close_modal(driver):
@@ -882,13 +1117,13 @@ def _close_modal(driver):
     try:
         dismiss = driver.find_element(By.XPATH, "//button[@aria-label='Dismiss']")
         js_click(driver, dismiss)
-        time.sleep(0.5)
+        time.sleep(0.3)
     except NoSuchElementException:
         return
     try:
         discard = driver.find_element(By.XPATH, "//button[contains(., 'Discard')]")
         js_click(driver, discard)
-        time.sleep(0.5)
+        time.sleep(0.3)
     except NoSuchElementException:
         pass
 
@@ -917,7 +1152,7 @@ def _ensure_easy_apply_filter(driver):
                 if btn.is_displayed():
                     js_click(driver, btn)
                     log("  Clicked Easy Apply filter button.")
-                    time.sleep(1)
+                    time.sleep(0.5)
                     return
             except NoSuchElementException:
                 continue
@@ -925,7 +1160,7 @@ def _ensure_easy_apply_filter(driver):
         clicked = js_find_and_click_button(driver, ["Easy Apply"])
         if clicked:
             log("  JS clicked Easy Apply filter.")
-            time.sleep(1)
+            time.sleep(0.5)
     except Exception as e:
         log(f"  Could not set Easy Apply filter: {e}")
 
@@ -942,7 +1177,7 @@ def _go_to_next_results_page(driver) -> bool:
             btn = driver.find_element(By.XPATH, xp)
             if btn.is_displayed() and btn.is_enabled():
                 js_click(driver, btn)
-                time.sleep(2)
+                time.sleep(1.2)
                 return True
         except NoSuchElementException:
             continue
@@ -957,6 +1192,7 @@ def _go_to_next_results_page(driver) -> bool:
 
 def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
     """Search for jobs with a keyword and apply. Returns updated count."""
+    global CURRENT_JOB_TITLE
     location = CONFIG["location"]
     max_apps = CONFIG.get("max_applications", 50)
     max_pages = int(CONFIG.get("max_pages_per_keyword", 10))
@@ -966,10 +1202,10 @@ def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
     log(f"Searching: '{keyword}' in {location}")
     log(f"{'='*60}")
     driver.get(url)
-    time.sleep(2)
+    time.sleep(1.2)
 
     _ensure_easy_apply_filter(driver)
-    time.sleep(1)
+    time.sleep(0.6)
 
     for page_num in range(1, max_pages + 1):
         log(f"Processing results page {page_num}/{max_pages}")
@@ -1003,6 +1239,7 @@ def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
                     continue
 
                 title = get_job_title(driver)
+                CURRENT_JOB_TITLE = title
                 log(f"\nJob #{applied_count + 1}: {title}")
                 if _contains_applied_marker(title):
                     log("  Skipping: already applied role.")
@@ -1024,9 +1261,9 @@ def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
 
                 # Return to same results page and continue processing pending jobs.
                 driver.get(current_results_url)
-                time.sleep(2)
+                time.sleep(1.2)
                 _ensure_easy_apply_filter(driver)
-                time.sleep(1)
+                time.sleep(0.6)
 
                 if applied_count >= max_apps:
                     log(f"Reached max applications ({max_apps}). Stopping.")
@@ -1048,7 +1285,7 @@ def apply_to_jobs(driver, keyword: str, applied_count: int) -> int:
             log("No next page available. Stopping pagination for this keyword.")
             break
         _ensure_easy_apply_filter(driver)
-        time.sleep(1)
+        time.sleep(0.6)
 
     return applied_count
 
